@@ -1,0 +1,135 @@
+# docker-compose.override.yml
+# CTB additions on top of upstream Hummingbot's docker-compose.yml.
+# Docker Compose auto-merges this file with the base compose at `docker compose up`.
+#
+# Adds:
+#   - emqx (MQTT broker)
+#   - postgres (state for hummingbot-api)
+#   - hummingbot-api (FastAPI bridge for our Vercel dashboard)
+#   - dashboard (Hummingbot's Streamlit ops UI)
+#
+# All exposed ports are bound to 127.0.0.1 only — reach them from a local
+# browser via SSH tunnel:
+#
+#   ssh -L 8501:localhost:8501 -L 8000:localhost:8000 -L 18083:localhost:18083 ctb-bot
+#
+# Then in your browser:
+#   http://localhost:8501  → Streamlit ops dashboard
+#   http://localhost:8000/docs → backend-api Swagger UI
+#   http://localhost:18083 → EMQX admin UI (rarely needed)
+#
+# Hummingbot itself stays on network_mode: host (per upstream) and reaches the
+# MQTT broker via 127.0.0.1:1883 once configured.
+
+services:
+  hummingbot:
+    # Wait for EMQX to be ready before Hummingbot starts (so MQTT bridge can connect).
+    # Doesn't change networking — Hummingbot stays on network_mode: host.
+    depends_on:
+      emqx:
+        condition: service_healthy
+
+  hummingbot-api:
+    container_name: hummingbot-api
+    image: hummingbot/hummingbot-api:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./bots:/hummingbot-api/bots
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    env_file:
+      - .env.api
+    environment:
+      - BROKER_HOST=emqx
+      - DATABASE_URL=postgresql+asyncpg://hbot:hummingbot-api@postgres:5432/hummingbot_api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - ctb-stack
+    depends_on:
+      postgres:
+        condition: service_healthy
+      emqx:
+        condition: service_healthy
+
+  dashboard:
+    container_name: hummingbot-dashboard
+    image: hummingbot/dashboard:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8501:8501"
+    environment:
+      - AUTH_SYSTEM_ENABLED=False
+      - BACKEND_API_HOST=hummingbot-api
+      - BACKEND_API_PORT=8000
+      - BACKEND_API_USERNAME=${API_USERNAME:-admin}
+      - BACKEND_API_PASSWORD=${API_PASSWORD:-admin}
+    networks:
+      - ctb-stack
+    depends_on:
+      - hummingbot-api
+
+  emqx:
+    container_name: hummingbot-broker
+    image: emqx:5
+    restart: unless-stopped
+    environment:
+      - EMQX_NAME=emqx
+      - EMQX_HOST=node1.emqx.local
+      - EMQX_CLUSTER__DISCOVERY_STRATEGY=static
+      - EMQX_CLUSTER__STATIC__SEEDS=[emqx@node1.emqx.local]
+      - EMQX_LOADED_PLUGINS=emqx_recon,emqx_retainer,emqx_management,emqx_dashboard
+    volumes:
+      - emqx-data:/opt/emqx/data
+      - emqx-log:/opt/emqx/log
+      - emqx-etc:/opt/emqx/etc
+    ports:
+      # Bound to host so Hummingbot (network_mode: host) can reach MQTT at 127.0.0.1:1883.
+      - "127.0.0.1:1883:1883"
+      # Admin UI — bind localhost-only; reach via SSH tunnel.
+      - "127.0.0.1:18083:18083"
+    networks:
+      ctb-stack:
+        aliases:
+          - node1.emqx.local
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx_ctl", "status"]
+      interval: 5s
+      timeout: 25s
+      retries: 5
+
+  postgres:
+    container_name: hummingbot-postgres
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=hummingbot_api
+      - POSTGRES_USER=hbot
+      - POSTGRES_PASSWORD=hummingbot-api
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # No host port mapping — only reachable from inside ctb-stack network.
+    networks:
+      - ctb-stack
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hbot -d hummingbot_api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  ctb-stack:
+    driver: bridge
+
+volumes:
+  emqx-data: {}
+  emqx-log: {}
+  emqx-etc: {}
+  postgres-data: {}
