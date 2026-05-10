@@ -64,12 +64,14 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8501:8501"
+    # Loads .env.api directly into the container so BACKEND_API_USERNAME and
+    # BACKEND_API_PASSWORD are read at runtime, not at compose-parse time.
+    env_file:
+      - .env.api
     environment:
       - AUTH_SYSTEM_ENABLED=False
       - BACKEND_API_HOST=hummingbot-api
       - BACKEND_API_PORT=8000
-      - BACKEND_API_USERNAME=${API_USERNAME:-admin}
-      - BACKEND_API_PASSWORD=${API_PASSWORD:-admin}
     networks:
       - ctb-stack
     depends_on:
