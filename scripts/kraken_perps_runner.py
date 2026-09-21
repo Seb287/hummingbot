@@ -11,27 +11,40 @@ that runs alongside Hummingbot, not inside it.
 
 Reuses (imports, does not duplicate) the trigger-detection and tier-sizing
 building blocks from ctb-research's already-audited capture_perps.py /
-capture.py -- same TIER_PARAMS, MIN_LOT, MAX_CONCURRENT, FuturesTradeStore
--- so the live decision logic matches exactly what the shadow book
+capture.py -- same TIER_PARAMS, MIN_LOT, FuturesTradeStore -- so the live
+decision logic matches exactly what the shadow book
 (capture_perps.py, running unmodified on Hetzner) has been validating.
 This module only adds a real order-execution layer behind those decisions.
 
 SAFETY (all defaults are the safe ones):
   - DRY_RUN: True unless env KRAKEN_LIVE=1 is set. In dry-run, every action
     that would touch the exchange is logged as "WOULD ..." and never sent.
-  - Kill switch: checks a local file (KILL_SWITCH_PATH, default
-    ctb-bot/KILL_SWITCH) before every decision and before every order.
-    Touch that file to halt immediately; delete it to resume.
-    TODO: swap for the mandatory Supabase `kill_switches` table polling
-    (ctb-bot/CLAUDE.md hard rule) once the Coolify self-host migration is
-    done -- see capture_executability_fixes memory. This local-file switch
-    is a stopgap, not a replacement for that.
+  - Kill switch: TWO independent layers, combined with OR (either one
+    halts). (1) Supabase `kill_switches` table, scope='global' (the
+    ctb-bot/CLAUDE.md hard rule -- self-hosted Supabase on swm-company-01
+    since 2026-09-21/22, see coolify_infra memory), polled over its REST
+    API (PostgREST) with the service-role key, cached for
+    KILL_SWITCH_POLL_S seconds so it isn't refetched on every single
+    decision. FAIL-CLOSED: any error reaching Supabase (network, auth,
+    missing env vars) is treated as ACTIVE, not inactive -- same "unknown
+    means don't trade" philosophy as efficiency_ratio_24h() in capture.py.
+    (2) A local file (KILL_SWITCH_PATH, default ctb-bot/KILL_SWITCH) as a
+    physical fallback that doesn't depend on network reaching Supabase --
+    touch it to halt immediately from the host itself, delete it to
+    resume. Both checked before every decision and before every order.
+    Activating either flattens any open real positions (see
+    flatten_all_positions()) and refuses all new entries -- not just a
+    "no new entries" gate.
   - MAX_STAKE_EUR / MAX_DAILY_LOSS_EUR: hard caps enforced in code before
     any order is placed, not just monitored after the fact.
 
 Credentials: KRAKEN_FUTURES_API_KEY / KRAKEN_FUTURES_API_SECRET env vars.
 Never hardcoded, never logged, never committed. Generate a Futures API key
 scoped to trade + read only -- NOT withdrawal.
+Supabase: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY env vars (service-role,
+per the schema's own comment: "the trader uses the service-role key" --
+RLS only allows authenticated-user reads + service-role writes, and this
+is a backend service, not a user session).
 
 Run (safe, always dry-run unless KRAKEN_LIVE=1 is exported):
     python ctb-bot/scripts/kraken_perps_runner.py --seconds 180
@@ -46,12 +59,13 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path("D:/ctb/ctb-research/src/ctb_research/ingest")))
-from capture import CORE, MAX_CONCURRENT, MIN_LOT, TIER_PARAMS, TRADE, log  # noqa: E402
+from capture import CORE, MIN_LOT, TIER_PARAMS, TRADE, log  # noqa: E402
 from capture_perps import FUTURES_SYMBOL, FuturesTradeStore  # noqa: E402
 
 FUTURES_BASE = "https://futures.kraken.com"
@@ -66,9 +80,65 @@ FEE = 0.0007
 MAX_STAKE_EUR = float(os.environ.get("MAX_STAKE_EUR", "50"))
 MAX_DAILY_LOSS_EUR = float(os.environ.get("MAX_DAILY_LOSS_EUR", "30"))
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+KILL_SWITCH_POLL_S = float(os.environ.get("KILL_SWITCH_POLL_S", "3"))
 
-def kill_switch_active() -> bool:
-    return KILL_SWITCH_PATH.exists()
+
+class SupabaseKillSwitch:
+    """Polls public.kill_switches (scope='global') over Supabase's REST API
+    (PostgREST, exposed by the self-hosted stack's Kong gateway). Cached for
+    KILL_SWITCH_POLL_S seconds -- cheap enough to check before every order
+    without adding a network round-trip to the hot path every time.
+
+    FAIL-CLOSED by design: missing env vars, a network error, a non-200
+    response, or a malformed body all resolve to active=True. A kill switch
+    that silently reads as "off" when it can't actually reach Supabase would
+    defeat the entire point of having one."""
+
+    def __init__(self):
+        self._cached_active = True  # safe default until the first real check
+        self._cached_reason = "nog niet gecontroleerd"
+        self._checked_at = 0.0
+
+    def _fetch(self) -> tuple[bool, str]:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            return True, "SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY niet ingesteld"
+        url = f"{SUPABASE_URL}/rest/v1/kill_switches?scope=eq.global&select=active,reason"
+        req = urllib.request.Request(url, headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "user-agent": "ctb-bot/kraken_perps_runner",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                rows = json.loads(resp.read())
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            return True, f"Supabase-check mislukt: {exc}"
+        if not rows:
+            return True, "geen global kill_switches-rij gevonden in Supabase"
+        row = rows[0]
+        active = bool(row.get("active"))
+        reason = row.get("reason") or ("handmatig geactiveerd" if active else "uit")
+        return active, reason
+
+    def active(self) -> tuple[bool, str]:
+        now = time.time()
+        if now - self._checked_at >= KILL_SWITCH_POLL_S:
+            self._cached_active, self._cached_reason = self._fetch()
+            self._checked_at = now
+        return self._cached_active, self._cached_reason
+
+
+_supabase_kill_switch = SupabaseKillSwitch()
+
+
+def kill_switch_active() -> tuple[bool, str]:
+    """Combined check: local file OR Supabase, whichever fires first. Always
+    returns (active, human-readable reason) so callers can log WHY."""
+    if KILL_SWITCH_PATH.exists():
+        return True, f"lokaal bestand aanwezig ({KILL_SWITCH_PATH})"
+    return _supabase_kill_switch.active()
 
 
 class KrakenFuturesClient:
@@ -132,6 +202,9 @@ class KrakenFuturesClient:
     def cancel_order(self, order_id: str) -> dict:
         return self._request("POST", "/cancelorder", {"order_id": order_id})
 
+    def cancel_all_orders(self, symbol: str | None = None) -> dict:
+        return self._request("POST", "/cancelallorders", {"symbol": symbol} if symbol else {})
+
 
 class OrderExecutor:
     """Places a bracket (entry + stop + take-profit) for one leg, honoring
@@ -146,8 +219,9 @@ class OrderExecutor:
         self.daily_loss = daily_loss_tracker
 
     def open_leg(self, pair: str, tier: str, stake_eur: float, entry_px: float) -> dict | None:
-        if kill_switch_active():
-            log(f"KILL SWITCH ACTIEF -- {pair} overgeslagen ({KILL_SWITCH_PATH})")
+        active, reason = kill_switch_active()
+        if active:
+            log(f"KILL SWITCH ACTIEF ({reason}) -- {pair} overgeslagen")
             return None
         if self.daily_loss.exceeded():
             log(f"DAGLIMIET BEREIKT (EUR {self.daily_loss.total:+.2f}) -- {pair} overgeslagen")
@@ -198,6 +272,37 @@ class OrderExecutor:
         self.client.send_order("ioc", pos["symbol"], "sell", pos["size"], reduce_only=True)
         log(f"LIVE: {pos['symbol']} gesloten @ market ({reason})")
 
+    def flatten_all_positions(self, reason: str) -> None:
+        """Closes EVERY real open position on Kraken, queried fresh from the
+        exchange rather than from in-process tracking -- this is what makes
+        it a real "flatten" (CLAUDE.md hard rule) and not just a "stop
+        opening new ones": it works correctly even after a restart, when any
+        locally-remembered stop/tp order IDs from open_leg() are long gone.
+        Called on kill-switch activation (both at startup and mid-run)."""
+        if DRY_RUN or self.client is None:
+            log(f"[DRY RUN] ZOU ALLE OPEN POSITIES SLUITEN ({reason})")
+            return
+        try:
+            positions = self.client.get_open_positions().get("openPositions", [])
+        except Exception as exc:
+            log(f"! kon open posities niet ophalen om te flatten: {exc}")
+            return
+        if not positions:
+            log(f"flatten ({reason}): geen open posities")
+            return
+        for pos in positions:
+            symbol, size, side = pos["symbol"], pos["size"], pos["side"]
+            try:
+                self.client.cancel_all_orders(symbol)
+            except Exception as exc:
+                log(f"! kon open orders voor {symbol} niet annuleren: {exc}")
+            close_side = "sell" if side == "long" else "buy"
+            try:
+                self.client.send_order("ioc", symbol, close_side, size, reduce_only=True)
+                log(f"LIVE: {symbol} geflattened ({reason}), {side} {size} gesloten @ market")
+            except Exception as exc:
+                log(f"! FLATTEN MISLUKT voor {symbol} -- {exc} -- HANDMATIG INGRIJPEN VEREIST")
+
 
 class DailyLossTracker:
     def __init__(self):
@@ -220,10 +325,19 @@ def main() -> int:
     ap.add_argument("--seconds", type=int, default=0)
     ap.add_argument("--check-only", action="store_true",
                      help="alleen get_wallets/get_open_positions tonen en stoppen (veilig, read-only)")
+    ap.add_argument("--check-kill-switch", action="store_true",
+                     help="alleen de kill-switch-status ophalen en tonen, dan stoppen (veilig, read-only, "
+                          "handig om de Supabase-koppeling te verifieren zonder de rest te starten)")
     args = ap.parse_args()
 
     log(f"kraken_perps_runner start -- DRY_RUN={DRY_RUN}, MAX_STAKE_EUR={MAX_STAKE_EUR}, "
-        f"MAX_DAILY_LOSS_EUR={MAX_DAILY_LOSS_EUR}, kill switch: {KILL_SWITCH_PATH}")
+        f"MAX_DAILY_LOSS_EUR={MAX_DAILY_LOSS_EUR}, kill switch: lokaal={KILL_SWITCH_PATH}, "
+        f"Supabase={SUPABASE_URL or '(niet ingesteld)'}")
+
+    if args.check_kill_switch:
+        active, reason = kill_switch_active()
+        log(f"kill switch: {'ACTIEF' if active else 'uit'} -- {reason}")
+        return 0
 
     api_key = os.environ.get("KRAKEN_FUTURES_API_KEY")
     api_secret = os.environ.get("KRAKEN_FUTURES_API_SECRET")
@@ -240,9 +354,21 @@ def main() -> int:
         log(json.dumps(client.get_open_positions(), indent=2))
         return 0
 
+    # Startup-flatten: als de kill switch al actief staat wanneer dit proces
+    # opstart (bv. na een crash terwijl 'm iemand had omgezet), sluit dan
+    # meteen alles wat nog open zou staan -- gebaseerd op de echte positie
+    # bij Kraken, niet op lokaal onthouden state die een herstart niet
+    # overleeft.
+    active, reason = kill_switch_active()
+    log(f"kill switch bij opstart: {'ACTIEF' if active else 'uit'} -- {reason}")
+    if active:
+        executor = OrderExecutor(client, DailyLossTracker())
+        executor.flatten_all_positions(f"kill switch actief bij opstart ({reason})")
+
     log("nog niet verbonden aan de live triggerloop -- dit is de execution-laag, "
-        "klaar om aangeroepen te worden zodra de kill-switch (Supabase) en het "
-        "startsein er zijn. Zie module-docstring.")
+        "klaar om aangeroepen te worden zodra het startsein er is. Zie module-docstring. "
+        "De kill-switch-koppeling (Supabase + lokaal bestand) is af en wordt hierboven "
+        "al gecontroleerd bij elke start en voor elke order (zie OrderExecutor.open_leg).")
     return 0
 
 
